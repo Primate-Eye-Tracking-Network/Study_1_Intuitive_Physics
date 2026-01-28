@@ -1,0 +1,14 @@
+video_file,experiment,version,condition,duration,audio_file,IA_apple_end_height,IA_apple_end_width,IA_apple_end_center_X,IA_apple_end_center_Y,IP_test_event_start,comment_test_IP,IP_relevant_1st_event_start,IP_relevant_1st_event_stop,1st_event_comment,IP_relevant_2nd_event_start,IP_relevant_2nd_event_stop,2nd_event_comment,IP_relevant_3rd_event_start,IP_relevant_3rd_event_stop,3rd_event_comment
+attentioncheck.mp4,attention_check,,,,attentioncheckX.wav,,,,,,,,,,,,,,,
+continuity_ver1_n_cont.mp4,continuity,ver1,cont,30897.5,continuity_ver1_n_contX.wav,190,200,1448,913,14900,,8115,10993,apple initially disappearing,14900,17900,apple after occlusion,,,
+continuity_ver1_n_test.mp4,continuity,ver1,test,30897.5,continuity_ver1_n_testX.wav,190,200,526,913,14900,,8078,10804,apple initially disappearing,14900,17900,apple after occlusion,,,
+continuity_ver2_n_cont.mp4,continuity,ver2,cont,33867.5,continuity_ver2_n_contX.wav,140,170,1674,679,11812,,10935,11564,apple initially disappearing,11812,12397,apple visible in between occluders,12650,15650,apple visible at end
+continuity_ver2_n_test.mp4,continuity,ver2,test,33867.5,continuity_ver2_n_testX.wav,140,170,1674,679,11812,,10935,11564,apple initially disappearing,11812,12397,apple visible in between occluders,12650,15650,apple visible at end
+gravity_ver1_n_cont.mp4,gravity,ver1,cont,30163.5,gravity_ver1_n_contX.wav,150,160,689,549,12250,,12250,15250,apple unsupported,,,,,,
+gravity_ver1_n_test.mp4,gravity,ver1,test,30163.5,gravity_ver1_n_testX.wav,150,160,1079,549,12250,,12250,15250,apple unsupported,,,,,,
+gravity_ver2_n_cont.mp4,gravity,ver2,cont,29829,gravity_ver2_n_contX.wav,160,180,1692,546,12032,,12032,13034,apple unsupported,,,,,,
+gravity_ver2_n_test.mp4,gravity,ver2,test,29829,gravity_ver2_n_testX.wav,160,180,1692,546,12032,,12032,13034,apple unsupported,,,,,,
+solidity_ver1_n_cont.mp4,solidity,ver1,cont,38538,solidity_ver1_n_contX.wav,130,160,1218,668,22289,,17625,19748,apple rolling behind occluder,22372,25372,apple revealed,,,
+solidity_ver1_n_test.mp4,solidity,ver1,test,38538,solidity_ver1_n_testX.wav,130,160,1657,668,22372,,17625,19748,apple rolling behind occluder,22372,25372,apple revealed,,,
+solidity_ver2_n_cont.mp4,solidity,ver2,cont,34868,solidity_ver2_n_contX.wav,140,160,1714,679,16323,,16323,16868,apple colliding with wall,,,,,,
+solidity_ver2_n_test.mp4,solidity,ver2,test,34868,solidity_ver2_n_testX.wav,140,160,1714,679,16654,,16323,16868,apple colliding with wall,,,,,,

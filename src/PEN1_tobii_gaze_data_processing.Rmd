@@ -1,0 +1,1042 @@
+---
+title: 'PEN1: Gaze data processing (Tobii)'
+output: html_document
+date: "2026-01-27"
+---
+
+## Analysis overview
+
+This script performs the following steps:
+
+1. Load video metadata and interest‑period timing
+2. Load and clean Tobii eye‑tracking data
+3. Align gaze samples with video timing
+4. Define interest periods (IPs)
+5. Quantify onscreen looking and trial inclusion
+6. Compute AOI‑based fixation durations
+7. Preprocess pupil size data:
+   - artefact detection (speed + MAD)
+   - interpolation
+   - baseline correction
+   - downsampling
+8. Generate trial‑level and group‑level plots
+
+To-do: 
+  - Select the first recorded trial of a subject with a particular video that fulfils the inclusion criteria.
+  - Add download link that works.
+
+---
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+# Core data handling
+library(tidyverse)
+library(readr)
+library(arrow)
+
+# Eye‑tracking utilities
+library(gazer)
+library(naniar)
+
+# Time and interpolation
+library(lubridate)
+library(zoo)
+
+# Plotting
+library(ggplot2)
+library(gghalves)
+```
+
+---
+
+# 2. Video metadata
+
+```{r}
+# -------------------------------------------------------
+# Load video timing and interest period definitions
+# -------------------------------------------------------
+
+min.time <- 0
+max.time <- 38600
+
+time_frame <- tibble(time_frame = seq(min.time, max.time, by = 1))
+
+video.data <- read_csv(
+  "../data/raw/PET1_video_list_frame_by_frame_matched_29-97fps.csv"
+) %>%
+  mutate(video_file = str_remove(video_file, fixed(".mp4"))) %>%
+  filter(experiment != "attention_check")
+
+video.data_variable_names <- colnames(video.data)
+```
+
+---
+
+# 3. Tobii eye‑tracking data
+```{r}
+# -------------------------------------------------------
+# Define local file path and download URL
+# -------------------------------------------------------
+
+local_file <- "../data/raw/chimpanzee/PET_network_study1_Ngamba_20_November.parquet"
+
+download_url <- "https://vetcloud.vetmeduni.ac.at/nextcloud/s/AMsoqiopW6TZGi7/download/PET_network_study1_Ngamba_20_November.parquet"
+
+# -------------------------------------------------------
+# Check whether file exists; download if missing
+# -------------------------------------------------------
+
+if (!file.exists(local_file)) {
+  message("File not found locally. Downloading from remote source...")
+
+  # Ensure target directory exists
+  dir.create(dirname(local_file), recursive = TRUE, showWarnings = FALSE)
+
+  # Download file
+  download.file(
+    url      = download_url,
+    destfile = local_file,
+    mode     = "wb",   # IMPORTANT for binary files (parquet)
+    quiet    = FALSE
+  )
+
+  message("Download completed.")
+} else {
+  message("File found locally. Using local copy.")
+}
+```
+
+```{r}
+# -------------------------------------------------------
+# Load Tobii data and harmonise column names
+# -------------------------------------------------------
+
+eye_data <- read_parquet(
+  "../data/raw/chimpanzee/PET_network_study1_Ngamba_20_November.parquet",
+  na = c("", "NA", "N/A")
+) %>%
+  rename_with(~ str_replace_all(.x, " ", "_")) %>%
+  filter(
+    Presented_Stimulus_name %in% c(
+      "continuity_ver1_n_cont", "continuity_ver1_n_test",
+      "continuity_ver2_n_cont", "continuity_ver2_n_test",
+      "gravity_ver1_n_cont",    "gravity_ver1_n_test",
+      "gravity_ver2_n_cont",    "gravity_ver2_n_test",
+      "solidity_ver1_n_cont",   "solidity_ver1_n_test",
+      "solidity_ver2_n_cont",   "solidity_ver2_n_test"
+    )
+  )
+```
+
+---
+
+## 3.1 Correct mislabeled solidity videos
+
+```{r}
+# NOTE:
+# Solidity ver1/ver2 labels were swapped in the Tobii export.
+# This correction is applied consistently to stimulus and media names.
+
+eye_data <- eye_data %>%
+  mutate(
+    Presented_Stimulus_name = case_when(
+      str_detect(Presented_Stimulus_name, "solidity") &
+        str_detect(Presented_Stimulus_name, "ver1") ~
+        str_replace(Presented_Stimulus_name, "ver1", "ver2"),
+
+      str_detect(Presented_Stimulus_name, "solidity") &
+        str_detect(Presented_Stimulus_name, "ver2") ~
+        str_replace(Presented_Stimulus_name, "ver2", "ver1"),
+
+      TRUE ~ Presented_Stimulus_name
+    ),
+    Presented_Media_name = Presented_Stimulus_name
+  )
+```
+
+---
+
+# 4. Experimental variables
+
+```{r}
+eye_data <- eye_data %>%
+  mutate(
+    experiment  = str_extract(Presented_Stimulus_name, "^[^_]+"),
+    version     = str_extract(Presented_Stimulus_name, "ver[0-9]+"),
+    condition   = if_else(str_detect(Presented_Stimulus_name, "_cont$"),
+                          "cont", "test"),
+    experiment_version = paste(experiment, version, sep = "_"),
+    subject     = Participant_name,
+    video_file  = Presented_Stimulus_name
+  )
+```
+
+---
+
+# 5. Merge gaze and video metadata
+
+```{r}
+sample_data <- eye_data %>%
+  full_join(video.data) %>%
+  dplyr::select(
+    Recording_name,
+    subject, experiment, version, condition, experiment_version,
+    video_file,
+    Eyetracker_timestamp,
+    Recording_timestamp,
+    Eye_movement_type,
+    Eye_movement_type_index,
+    Gaze_event_duration,
+    starts_with("AOI_hit_"),
+    starts_with("Gaze_point_"),
+    starts_with("Pupil_diameter"),
+    all_of(video.data_variable_names),
+    Validity_left,
+    Validity_right
+  )
+```
+
+---
+
+# 6. Time alignment
+
+```{r}
+# Convert recording timestamps to trial‑relative milliseconds
+
+sample_data <- sample_data %>%
+  group_by(subject, video_file, Recording_name) %>%
+  mutate(
+    time_frame = (Recording_timestamp -
+                    min(Recording_timestamp, na.rm = TRUE)) / 1000
+  ) %>%
+  ungroup()
+```
+
+---
+
+# 7. Onscreen looking and interest periods
+
+```{r}
+# Onscreen gaze definition (screen resolution: 1920 × 1080)
+
+gaze_ip <- sample_data %>%
+  mutate(
+    onscreen =
+      !is.na(Gaze_point_X) &
+      !is.na(Gaze_point_Y) &
+      Gaze_point_X >= 0 & Gaze_point_X < 1920 &
+      Gaze_point_Y >= 0 & Gaze_point_Y < 1080
+  ) %>%
+  arrange(subject, video_file, Recording_name, time_frame) %>%
+  group_by(subject, video_file, Recording_name) %>%
+  mutate(dt = lead(time_frame) - time_frame) %>%
+  ungroup()
+```
+
+---
+
+## 7.1 Interest‑period summaries
+
+```{r}
+# Compute gaze duration within each interest period
+
+ip_summary <- gaze_ip %>%
+  mutate(
+    in_IP1 = onscreen &
+      time_frame >= IP_relevant_1st_event_start &
+      time_frame <= IP_relevant_1st_event_stop,
+
+    in_IP2 = onscreen &
+      time_frame >= IP_relevant_2nd_event_start &
+      time_frame <= IP_relevant_2nd_event_stop,
+
+    in_IP3 = onscreen &
+      time_frame >= IP_relevant_3rd_event_start &
+      time_frame <= IP_relevant_3rd_event_stop
+  ) %>%
+  group_by(
+    video_file, experiment, version, condition,
+    subject, Recording_name
+  ) %>%
+  summarise(
+    IP1_gaze_time = sum(dt[in_IP1], na.rm = TRUE),
+    IP2_gaze_time = sum(dt[in_IP2], na.rm = TRUE),
+    IP3_gaze_time = sum(dt[in_IP3], na.rm = TRUE),
+
+    IP1_duration = first(IP_relevant_1st_event_stop -
+                          IP_relevant_1st_event_start),
+    IP2_duration = first(IP_relevant_2nd_event_stop -
+                          IP_relevant_2nd_event_start),
+    IP3_duration = first(IP_relevant_3rd_event_stop -
+                          IP_relevant_3rd_event_start),
+
+    .groups = "drop"
+  )
+```
+
+---
+
+## 7.2 Trial inclusion criteria
+
+```{r}
+# Trials are included only if at least 100 ms of gaze
+# data are available in each relevant interest period.
+
+ip_summary <- ip_summary %>%
+  mutate(
+    include_trial =
+      (is.na(IP1_duration) | IP1_gaze_time > 100) &
+      (is.na(IP2_duration) | IP2_gaze_time > 100) &
+      (is.na(IP3_duration) | IP3_gaze_time > 100)
+  )
+
+write_csv(
+  ip_summary,
+  "../data/processed/chimpanzee/Ngamba_chimps_trial_inclusion.csv"
+)
+```
+
+
+## 7.3 Plotting onscreen gaze and inclusion/exclusion
+#### Trial inclusion vs exclusion
+```{r}
+# -------------------------------------------------------
+# Summarise included vs excluded trials
+# -------------------------------------------------------
+
+included_trials_plot_data <- ip_summary %>%
+  mutate(
+    trial_status = if_else(include_trial, "Included", "Excluded")
+  ) %>%
+  count(experiment, version, condition, trial_status) %>%
+  complete(
+    experiment,
+    version,
+    condition,
+    trial_status = c("Included", "Excluded"),
+    fill = list(n = 0)
+  )
+
+# -------------------------------------------------------
+# Plot: Included vs excluded trials
+# -------------------------------------------------------
+
+included_trials_plot <- ggplot(
+  included_trials_plot_data,
+  aes(x = condition, y = n, fill = trial_status)
+) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.7
+  ) +
+  facet_grid(experiment ~ version) +
+  scale_fill_manual(
+    values = c(
+      Included = "darkgreen",
+      Excluded = "darkred"
+    )
+  ) +
+  labs(
+    x = "Condition",
+    y = "Number of trials",
+    fill = "Trial status",
+    title = "Included vs Excluded Trials by Experiment and Version"
+  ) +
+  theme_bw() +
+  theme(
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(hjust = 0.5)
+  )
+included_trials_plot
+ggsave(
+  included_trials_plot,
+  filename = "../results/figures/chimpanzee/Ngamba_included_excluded_trials_in_relevant_IPs_100ms.png",
+  width = 10,
+  height = 6,
+  scale = 0.75
+)
+```
+
+
+### Cumulative onscreen looking over time
+
+- Bins gaze data into **100 ms windows**
+- Computes the **proportion of recordings looking onscreen**
+- Overlays **interest period (IP) shading**
+- Produces two plots:
+  1. Separate panels per condition
+  2. Condition‑colored lines per experiment/version
+
+
+#### Step 1: Bin gaze data
+
+
+### Cumulative onscreen look plots
+```{r}
+# -------------------------------------------------------
+# Bin gaze data into 100 ms intervals
+# -------------------------------------------------------
+
+gaze_ip_binned <- gaze_ip %>%
+  filter(!is.na(time_frame)) %>%
+  mutate(time_bin = floor(time_frame / 100) * 100)
+
+# -------------------------------------------------------
+# Determine onscreen presence per recording and time bin
+# -------------------------------------------------------
+
+bin_recording <- gaze_ip_binned %>%
+  group_by(
+    experiment,
+    version,
+    condition,
+    subject,
+    Recording_name,
+    time_bin
+  ) %>%
+  summarise(
+    onscreen_in_bin = any(onscreen),
+    .groups = "drop"
+  )
+```
+
+---
+
+#### Step 2: Aggregate across recordings
+
+```{r}
+# -------------------------------------------------------
+# Aggregate across recordings to obtain proportions
+# -------------------------------------------------------
+
+bin_summary <- bin_recording %>%
+  group_by(experiment, version, condition, time_bin) %>%
+  summarise(
+    n_onscreen   = sum(onscreen_in_bin),
+    n_present    = n(),   # number of recordings contributing data
+    prop_onscreen = n_onscreen / n_present,
+    .groups = "drop"
+  )
+```
+
+---
+
+#### Step 3: Prepare interest‑period rectangles
+
+```{r}
+# -------------------------------------------------------
+# Prepare interest‑period (IP) rectangles for plotting
+# -------------------------------------------------------
+
+ip_rects_long <- gaze_ip %>%
+  distinct(
+    experiment,
+    version,
+    condition,
+    video_file,
+    IP_relevant_1st_event_start,
+    IP_relevant_1st_event_stop,
+    IP_relevant_2nd_event_start,
+    IP_relevant_2nd_event_stop,
+    IP_relevant_3rd_event_start,
+    IP_relevant_3rd_event_stop
+  ) %>%
+  pivot_longer(
+    cols = starts_with("IP_relevant"),
+    names_to = c("IP", "bound"),
+    names_pattern = "IP_relevant_(.*)_event_(start|stop)",
+    values_to = "time"
+  ) %>%
+  pivot_wider(
+    names_from = bound,
+    values_from = time
+  ) %>%
+  filter(!is.na(start), !is.na(stop)) %>%
+  mutate(
+    IP = factor(
+      IP,
+      levels = c("1st", "2nd", "3rd"),
+      labels = c("IP1", "IP2", "IP3")
+    )
+  )
+```
+
+---
+
+#### Plot 1: Separate panels per condition
+
+```{r}
+onscreen_cum_plot <- ggplot() +
+
+  # --- Interest‑period background shading ---
+  geom_rect(
+    data = ip_rects_long,
+    aes(
+      xmin = start,
+      xmax = stop,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = IP
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.8
+  ) +
+
+  # --- Onscreen proportion ---
+  geom_line(
+    data = bin_summary,
+    aes(x = time_bin, y = prop_onscreen),
+    linewidth = 1
+  ) +
+
+  facet_grid(
+    experiment ~ version + condition,
+    scales = "free_x"
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      IP1 = "#66c2a5",
+      IP2 = "#fc8d62",
+      IP3 = "#8da0cb"
+    ),
+    name = "Interest Period"
+  ) +
+
+  labs(
+    x = "Time (ms)",
+    y = "Proportion of recordings\nlooking onscreen",
+    title = "Onscreen gaze over time with Interest Periods"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90")
+  )
+
+onscreen_cum_plot
+
+ggsave(
+  onscreen_cum_plot,
+  filename = "../results/figures/chimpanzee/Ngamba_cumulative_onscreen_looks.png",
+  width = 14,
+  height = 6,
+  scale = 0.85
+)
+```
+
+---
+
+#### plot 2: Condition‑colored lines
+
+
+```{r}
+onscreen_cum_plot2 <- ggplot() +
+
+  # --- Interest‑period background shading ---
+  geom_rect(
+    data = ip_rects_long,
+    aes(
+      xmin = start,
+      xmax = stop,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = IP
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.8
+  ) +
+
+  # --- Onscreen proportion by condition ---
+  geom_line(
+    data = bin_summary,
+    aes(x = time_bin, y = prop_onscreen, color = condition),
+    linewidth = 1
+  ) +
+
+  facet_grid(
+    experiment ~ version,
+    scales = "free_x"
+  ) +
+
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      IP1 = "#66c2a5",
+      IP2 = "#fc8d62",
+      IP3 = "#8da0cb"
+    ),
+    name = "Interest Period"
+  ) +
+  scale_color_manual(
+    values = c(
+      cont = "dodgerblue",
+      test = "firebrick"
+    )
+  ) +
+
+  labs(
+    x = "Time (ms)",
+    y = "Proportion of recordings\nlooking onscreen",
+    title = "Onscreen gaze over time with Interest Periods"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90")
+  )
+onscreen_cum_plot2
+ggsave(
+  onscreen_cum_plot2,
+  filename = "../results/figures/chimpanzee/Ngamba_cumulative_onscreen_looks2.png",
+  width = 14,
+  height = 6,
+  scale = 0.85
+)
+```
+
+
+---
+
+# 8. Pupil preprocessing (overview)
+
+> **Summary of preprocessing steps**
+
+- Blink artefacts removed via speed‑based MAD filtering
+- Threshold set to **8 × MAD**, based on visual inspection
+- Up to 100 consecutive datapoints interpolated
+- Baseline correction using 3‑second pre‑event window
+- Downsampling to 10 Hz (100 ms bins)
+
+
+---
+
+## 8.1 Artefact detection helpers
+
+```{r}
+speed_pupil_safe <- function(pup, time) {
+  cur_speed <- diff(pup) / diff(time)
+  abs(pmax(c(NA, cur_speed), c(cur_speed, NA), na.rm = TRUE))
+}
+
+calc_mad_safe <- function(x, n = 8) {
+  if (all(is.na(x))) return(NA_real_)
+  median(x, na.rm = TRUE) + n * mad(x, na.rm = TRUE)
+}
+```
+
+---
+
+
+---
+
+# 8.3 Pupil and gaze variable harmonisation
+
+```{r}
+# Rename pupil and gaze variables for clarity
+sample_data <- sample_data %>%
+  rename(
+    LEFT_PUPIL_SIZE  = Pupil_diameter_left,
+    RIGHT_PUPIL_SIZE = Pupil_diameter_right,
+    LEFT_GAZE_X      = Gaze_point_left_X,
+    LEFT_GAZE_Y      = Gaze_point_left_Y,
+    RIGHT_GAZE_X     = Gaze_point_right_X,
+    RIGHT_GAZE_Y     = Gaze_point_right_Y
+  )
+```
+
+---
+
+# 8.4 Trial indexing
+
+```{r}
+# Assign trial index within each recording
+sample_data <- sample_data %>%
+  group_by(subject, experiment, version, condition, video_file) %>%
+  mutate(
+    trial = match(
+      Recording_name,
+      sort(unique(Recording_name))
+    )
+  ) %>%
+  ungroup()
+```
+
+---
+
+# 8.5 Artefact detection and interpolation (raw pupil)
+
+## Rationale
+
+Blink artefacts are detected using **pupil dilation speed**.
+Outliers are identified via a **Median Absolute Deviation (MAD)** threshold
+and removed before interpolation.
+
+---
+
+```{r}
+sample_data <- sample_data %>%
+  group_by(
+    Recording_name,
+    subject,
+    experiment,
+    version,
+    condition,
+    video_file
+  ) %>%
+  mutate(
+    # --- Combined pupil ---
+    speed_pupil_all = speed_pupil_safe(Pupil_diameter_filtered, time_frame),
+    MAD_pupil_all   = calc_mad_safe(speed_pupil_all, n = 8),
+    pupil_noArtefact = ifelse(
+      !is.na(speed_pupil_all) & speed_pupil_all < MAD_pupil_all,
+      Pupil_diameter_filtered,
+      NA_real_
+    ),
+    pupil_interpolated = zoo::na.approx(
+      pupil_noArtefact,
+      na.rm = FALSE,
+      maxgap = 100
+    ),
+
+    # --- Left pupil ---
+    speed_left = speed_pupil_safe(LEFT_PUPIL_SIZE, time_frame),
+    MAD_left   = calc_mad_safe(speed_left, n = 8),
+    LEFT_pupil_noArtefact = ifelse(
+      !is.na(speed_left) & speed_left < MAD_left,
+      LEFT_PUPIL_SIZE,
+      NA_real_
+    ),
+    LEFT_pupil_interpolated = zoo::na.approx(
+      LEFT_pupil_noArtefact,
+      na.rm = FALSE,
+      maxgap = 100
+    ),
+
+    # --- Right pupil ---
+    speed_right = speed_pupil_safe(RIGHT_PUPIL_SIZE, time_frame),
+    MAD_right   = calc_mad_safe(speed_right, n = 8),
+    RIGHT_pupil_noArtefact = ifelse(
+      !is.na(speed_right) & speed_right < MAD_right,
+      RIGHT_PUPIL_SIZE,
+      NA_real_
+    ),
+    RIGHT_pupil_interpolated = zoo::na.approx(
+      RIGHT_pupil_noArtefact,
+      na.rm = FALSE,
+      maxgap = 100
+    )
+  ) %>%
+  ungroup()
+```
+
+---
+
+# 8.6 Baseline correction
+
+## Rationale
+
+Baseline pupil size is computed as the **median pupil size**
+during the **3 seconds preceding** the test event onset.
+
+---
+
+```{r}
+# Baseline window: −3000 to 0 ms before test event
+baseline_data <- sample_data %>%
+  filter(
+    time_frame < IP_test_event_start &
+      time_frame >= IP_test_event_start - 3000
+  ) %>%
+  group_by(
+    Recording_name,
+    subject,
+    video_file,
+    experiment,
+    version,
+    condition,
+    trial
+  ) %>%
+  summarise(
+    baseline_left  = median(LEFT_pupil_interpolated, na.rm = TRUE),
+    baseline_right = median(RIGHT_pupil_interpolated, na.rm = TRUE),
+    baseline_all   = median(pupil_interpolated, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+---
+
+```{r}
+# Apply baseline correction to post‑event window (0–6000 ms)
+data_pupil_bc <- sample_data %>%
+  filter(
+    time_frame > IP_test_event_start &
+      time_frame <= IP_test_event_start + 6000
+  ) %>%
+  left_join(baseline_data) %>%
+  mutate(
+    LEFT_pupil_bc  = LEFT_pupil_interpolated  / baseline_left,
+    RIGHT_pupil_bc = RIGHT_pupil_interpolated / baseline_right,
+    pupil_bc       = pupil_interpolated       / baseline_all
+  )
+```
+
+---
+
+# 8.7 Downsampling to 10 Hz
+
+## Rationale
+
+To reduce noise and computational load,
+pupil data are downsampled to **100 ms bins** using the median.
+
+---
+
+```{r}
+data_pupil_bc_ds <- data_pupil_bc %>%
+  mutate(
+    bin = floor(time_frame / 100) * 100
+  ) %>%
+  group_by(
+    Recording_name,
+    subject,
+    video_file,
+    experiment,
+    version,
+    condition,
+    trial,
+    bin
+  ) %>%
+  summarise(
+    LEFT_pupil_bc  = median(LEFT_pupil_bc, na.rm = TRUE),
+    RIGHT_pupil_bc = median(RIGHT_pupil_bc, na.rm = TRUE),
+    pupil_bc       = median(pupil_bc, na.rm = TRUE),
+    LEFT_GAZE_X    = median(LEFT_GAZE_X, na.rm = TRUE),
+    LEFT_GAZE_Y    = median(LEFT_GAZE_Y, na.rm = TRUE),
+    RIGHT_GAZE_X   = median(RIGHT_GAZE_X, na.rm = TRUE),
+    RIGHT_GAZE_Y   = median(RIGHT_GAZE_Y, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+---
+
+# 8.8 Second‑pass artefact filtering (downsampled)
+
+```{r}
+data_pupil_bc_ds <- data_pupil_bc_ds %>%
+  group_by(
+    Recording_name,
+    subject,
+    video_file,
+    experiment,
+    version,
+    condition,
+    trial
+  ) %>%
+  mutate(
+    speed_left_ds  = speed_pupil_safe(LEFT_pupil_bc, bin),
+    speed_right_ds = speed_pupil_safe(RIGHT_pupil_bc, bin),
+    speed_all_ds   = speed_pupil_safe(pupil_bc, bin),
+
+    MAD_left_ds  = calc_mad_safe(speed_left_ds,  n = 8),
+    MAD_right_ds = calc_mad_safe(speed_right_ds, n = 8),
+    MAD_all_ds   = calc_mad_safe(speed_all_ds,   n = 8),
+
+    LEFT_pupil_ds  = zoo::na.approx(
+      ifelse(speed_left_ds < MAD_left_ds, LEFT_pupil_bc, NA),
+      na.rm = FALSE
+    ),
+    RIGHT_pupil_ds = zoo::na.approx(
+      ifelse(speed_right_ds < MAD_right_ds, RIGHT_pupil_bc, NA),
+      na.rm = FALSE
+    ),
+    pupil_ds = zoo::na.approx(
+      ifelse(speed_all_ds < MAD_all_ds, pupil_bc, NA),
+      na.rm = FALSE
+    )
+  ) %>%
+  ungroup()
+```
+
+---
+
+# 8.9 Proportion of valid pupil data
+
+```{r}
+prop_pupil_available <- data_pupil_bc_ds %>%
+  group_by(
+    Recording_name,
+    subject,
+    video_file,
+    experiment,
+    version,
+    condition,
+    trial
+  ) %>%
+  summarise(
+    prop_valid = mean(!is.na(pupil_ds)),
+    .groups = "drop"
+  )
+
+# Exclude trials with <70% usable pupil data
+excluded_trials <- prop_pupil_available %>%
+  filter(prop_valid < 0.7)
+```
+
+---
+
+# 8.10 Save processed pupil data
+
+```{r}
+write_parquet(
+  data_pupil_bc_ds,
+  "../data/processed/chimpanzee/PET1_chimp_Ngamba_basecorrected_downsampled.parquet"
+)
+```
+
+---
+
+# 9. Group‑level aggregation
+
+```{r}
+data_pupil_group <- data_pupil_bc_ds %>%
+  anti_join(excluded_trials) %>%
+  group_by(
+    bin,
+    experiment,
+    version,
+    condition,
+    video_file
+  ) %>%
+  summarise(
+    mean_pupil = mean(pupil_ds, na.rm = TRUE),
+    se_pupil   = sd(pupil_ds, na.rm = TRUE) / sqrt(sum(!is.na(pupil_ds))),
+    RIGHT_mean_pupil = mean(RIGHT_pupil_ds, na.rm = TRUE),
+    RIGHT_se_pupil   = sd(RIGHT_pupil_ds, na.rm = TRUE) / sqrt(sum(!is.na(RIGHT_pupil_ds))),
+    LEFT_mean_pupil = mean(LEFT_pupil_ds, na.rm = TRUE),
+    LEFT_se_pupil   = sd(LEFT_pupil_ds, na.rm = TRUE) / sqrt(sum(!is.na(LEFT_pupil_ds))),
+    .groups = "drop"
+  )
+```
+
+---
+
+# 10. Group‑level pupil plots
+
+```{r}
+ggplot(data_pupil_group,
+       aes(x = bin, y = mean_pupil, color = condition, fill = condition)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+    aes(ymin = mean_pupil - se_pupil,
+        ymax = mean_pupil + se_pupil),
+    alpha = 0.3,
+    color = NA
+  ) +
+  facet_wrap(
+  vars(experiment, version),
+  scales = "free_x", nrow=3
+)+
+  theme_bw() +
+  labs(
+    x = "Time (ms)",
+    y = "Baseline-corrected pupil size",
+    title = "Group-level pupil response"
+  ) +
+  scale_color_manual(values = c(cont = "dodgerblue", test = "firebrick")) +
+  scale_fill_manual(values = c(cont = "dodgerblue", test = "firebrick"))
+
+ggsave(
+  filename = "../results/figures/chimpanzee/Ngamba_pupil_size_grouplevel.png",
+  width = 10,
+  height = 12,
+  scale = 0.7
+)
+```
+
+```{r}
+ggplot(data_pupil_group,
+       aes(x = bin, y = RIGHT_mean_pupil, color = condition, fill = condition)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+    aes(ymin = RIGHT_mean_pupil - RIGHT_se_pupil,
+        ymax = RIGHT_mean_pupil + RIGHT_se_pupil),
+    alpha = 0.3,
+    color = NA
+  ) +
+  facet_wrap(
+  vars(experiment, version),
+  scales = "free_x", nrow=3
+)+
+  theme_bw() +
+  labs(
+    x = "Time (ms)",
+    y = "Baseline-corrected pupil size",
+    title = "Group-level right pupil response"
+  ) +
+  scale_color_manual(values = c(cont = "dodgerblue", test = "firebrick")) +
+  scale_fill_manual(values = c(cont = "dodgerblue", test = "firebrick"))
+
+ggsave(
+  filename = "../results/figures/chimpanzee/Ngamba_right_pupil_size_grouplevel.png",
+  width = 10,
+  height = 12,
+  scale = 0.7
+)
+```
+
+```{r}
+ggplot(data_pupil_group,
+       aes(x = bin, y = RIGHT_mean_pupil, color = condition, fill = condition)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+    aes(ymin = RIGHT_mean_pupil - RIGHT_se_pupil,
+        ymax = RIGHT_mean_pupil + RIGHT_se_pupil),
+    alpha = 0.3,
+    color = NA
+  ) +
+  facet_wrap(
+  vars(experiment, version),
+  scales = "free_x", nrow=3
+)+
+  theme_bw() +
+  labs(
+    x = "Time (ms)",
+    y = "Baseline-corrected pupil size",
+    title = "Group-level left pupil response"
+  ) +
+  scale_color_manual(values = c(cont = "dodgerblue", test = "firebrick")) +
+  scale_fill_manual(values = c(cont = "dodgerblue", test = "firebrick"))
+
+ggsave(
+  filename = "../results/figures/chimpanzee/Ngamba_left_pupil_size_grouplevel.png",
+  width = 10,
+  height = 12,
+  scale = 0.7
+)
+```
+
+
+
+
+---
