@@ -1,6 +1,0 @@
-.Rproj.user
-.Rhistory
-.RData
-.Ruserdata
-# Ignore all raw chimpanzee data files
-data/raw/chimpanzee/*
