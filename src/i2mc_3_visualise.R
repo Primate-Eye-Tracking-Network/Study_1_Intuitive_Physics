@@ -1,8 +1,10 @@
 library(tidyverse)
 library(shiny)
+library(arrow)
 
-# df_test <- read_csv('https://share.eva.mpg.de/index.php/s/Z6aKPTiNHjTptw5/download/i2mc_fix.csv')
-df_test <- read_csv('data/temp/i2mc_fix.csv')
+# if fixation file not in folder: 
+# download.file('https://share.eva.mpg.de/public.php/dav/files/4bzN8QaCS4TBBtr/?accept=zip', 'data/temp/i2mc_fix.parquet')
+df_test <- read_parquet('data/temp/i2mc_fix.parquet')
 
 shinyApp(ui = fluidPage(
   sidebarLayout(
