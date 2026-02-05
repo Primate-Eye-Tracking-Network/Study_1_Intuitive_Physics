@@ -50,3 +50,6 @@ rsconnect/
   
 # Data folder
 data/raw/
+
+# DS_Store (macbook thing)
+*/.DS_Store
