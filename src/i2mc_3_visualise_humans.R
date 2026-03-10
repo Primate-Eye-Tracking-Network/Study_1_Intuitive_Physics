@@ -2,30 +2,24 @@ library(tidyverse)
 library(shiny)
 library(arrow)
 
+# if fixation file not in folder: 
+# download.file('https://share.eva.mpg.de/public.php/dav/files/EnGmKy2xdCjTRR3/?accept=zip', 'data/temp/i2mc_fix_human.parquet')
+df_test <- read_parquet('data/temp/i2mc_fix_human.parquet') #TODO: only data for gravity_ver2_n_test
 # if loc file not in folder: 
 # download.file('https://share.eva.mpg.de/public.php/dav/files/jAo8pao3DCr3tDf/?accept=zip', 'data/temp/apple_loc.parquet')
 locs <- read_parquet('data/temp/apple_loc.parquet') %>%  #TODO: for all videos
-  mutate(frame = index + 1,
-         presented_stimulus_name = 'gravity_ver2_n_test') %>% 
-  select(!index)
+  mutate(frame = index + 1) %>% 
+  left_join(select(df_test, c(video_frame_index, media_timestamp)),
+            by = join_by(frame == video_frame_index), 
+            multiple = 'first')
 
-# if fixation file not in folder: 
-# download.file('https://share.eva.mpg.de/public.php/dav/files/4bzN8QaCS4TBBtr/?accept=zip', 'data/temp/i2mc_fix.parquet')
-df_test <- read_parquet('data/temp/i2mc_fix.parquet') %>% 
-  group_by(recname) %>% 
-  mutate(frame = case_when(presented_stimulus_name == 'gravity_ver2_n_test' ~ round(media_timestamp/(max(media_timestamp)/(894-1))) + 1)) %>% 
-  left_join(locs)
 
 shinyApp(ui = fluidPage(
   sidebarLayout(
     sidebarPanel(
       fluidRow(
-        column(12, selectInput('name', 'Name:',
-                               unique(df_test$participant_name)))
-      ),
-      fluidRow(
-        column(12, radioButtons('recname', 'Recording name:',
-                                1:16))
+        column(12, radioButtons('recname', 'Recording session:',
+                                unique(df_test$recording_session_label)))
       ),
       fluidRow(
         column(12, verbatimTextOutput('text_legend'))
@@ -43,32 +37,29 @@ shinyApp(ui = fluidPage(
       )
     ))),
   server = function(input, output, session) {
-    recchoices <- reactive({
-      unique(filter(df_test, participant_name == input$name)$recording_name)
-    })
-    observeEvent(recchoices(), {
-      choices <- recchoices()
-      updateRadioButtons(inputId = 'recname', choices = choices)
-    })
+    # recchoices <- reactive({
+    #   unique(filter(df_test, participant_id == input$name)$recording_session_label)
+    # })
+    # observeEvent(recchoices(), {
+    #   choices <- recchoices()
+    #   updateRadioButtons(inputId = 'recname', choices = choices)
+    # })
     
     recdata <- reactive({
-        df_test %>% filter(participant_name == input$name & recording_name == input$recname)
+      df_test %>% filter(recording_session_label == input$recname)
     })
     
     fixdata <- reactive({
-      recdata() %>% filter(eye_movement_type == 'Fixation') %>% 
-        drop_na(recording_timestamp) %>% 
-        group_by(eye_movement_type_index) %>% 
-        summarise(xpos = first(fixation_point_x),
-                  ypos = first(fixation_point_y),
-                  dur = first(gaze_event_duration),
+      recdata() %>% filter(!is.na(right_fix_index)) %>% 
+        group_by(right_fix_index) %>% 
+        summarise(xpos = mean(average_gaze_x), #TODO: FIXATION POINT NOT EXPORTED FROM EYELINK?
+                  ypos = mean(average_gaze_y),
                   startT = first(media_timestamp),
                   endT = last(media_timestamp))
     })
     
     i2mcdata <- reactive({
       recdata() %>%
-        drop_na(recording_timestamp) %>% 
         drop_na(i2mc_index) %>% 
         group_by(i2mc_index) %>% 
         summarise(xpos = first(xpos),
@@ -80,22 +71,22 @@ shinyApp(ui = fluidPage(
     gaze_plot_x <- reactive({
       ggplot() + 
         lims(y = c(-500, 2500)) +
-        geom_line(aes(media_timestamp, apple_x), data= recdata(), linewidth = 5, colour = 'green', alpha = .5) + # Apple path. not to scale
+        geom_line(aes(media_timestamp, apple_x), data= locs, linewidth = 5, colour = 'green', alpha = .5) + # Apple path. not to scale
         geom_linerange(aes(y = xpos, xmin = startT, xmax = endT), data = fixdata(), linewidth = 5, colour = 'deeppink') +
-        guides(colour = guide_legend(title = 'tobii')) +
+        guides(colour = guide_legend(title = 'eyelink')) +
         geom_linerange(aes(y = xpos, xmin = startT, xmax = endT), data = i2mcdata(), linewidth = 1, colour = 'black') +
-        geom_line(aes(media_timestamp, gaze_point_left_x), linewidth = .2, alpha = .3, colour = 'darkgreen', data = recdata())+
-        geom_line(aes(media_timestamp, gaze_point_right_x), linewidth = .2, alpha = .3, colour = 'red', data = recdata()) 
+        geom_line(aes(media_timestamp, left_gaze_x), linewidth = .2, alpha = .3, colour = 'darkgreen', data = recdata())+
+        geom_line(aes(media_timestamp, right_gaze_x), linewidth = .2, alpha = .3, colour = 'red', data = recdata()) 
     })
     
     gaze_plot_y <- reactive({
       ggplot() + 
         lims(y = c(-500, 1600)) +
-        geom_line(aes(media_timestamp, apple_y), data= recdata(), linewidth = 5, colour = 'green', alpha = .5) + # Apple path. not to scale
+        geom_line(aes(media_timestamp, apple_y), data= locs, linewidth = 5, colour = 'green', alpha = .5) +
         geom_linerange(aes(y = ypos, xmin = startT, xmax = endT), data = fixdata(), linewidth = 5, colour = 'deeppink') +
         geom_linerange(aes(y = ypos, xmin = startT, xmax = endT), data = i2mcdata(), linewidth = 1, colour = 'black') +
-        geom_line(aes(media_timestamp, gaze_point_left_y), linewidth = .2, alpha = .3, colour = 'darkgreen', data = recdata())+
-        geom_line(aes(media_timestamp, gaze_point_right_y), linewidth = .2, alpha = .3, colour = 'red', data = recdata())
+        geom_line(aes(media_timestamp, left_gaze_y), linewidth = .2, alpha = .3, colour = 'darkgreen', data = recdata())+
+        geom_line(aes(media_timestamp, right_gaze_y), linewidth = .2, alpha = .3, colour = 'red', data = recdata())
     })
     
     output$plot <- renderPlot({
@@ -123,13 +114,12 @@ shinyApp(ui = fluidPage(
     })
     
     output$text <- renderText({
-      vid <- unique(recdata()$presented_stimulus_name)
-      date <- unique(recdata()$recording_date)
-      sprintf('Date: %s, Condition: %s', date, vid)
+      vid <- unique(recdata()$video_name)
+      sprintf('Condition: %s', vid)
     })
     
     output$text_legend <- renderText({
-      "Dark green line: left eye gaze\nRed line: right eye gaze\nPink dash: tobii fixations\nBlack dash: i2mc fixations\nGrey rectangle:\nscreen size limits and TOI"
+      "Dark green line: left eye gaze\nRed line: right eye gaze\nPink dash: eyelink fixations\nBlack dash: i2mc fixations\nGrey rectangle:\nscreen size limits and TOI"
     })
   }
 )
