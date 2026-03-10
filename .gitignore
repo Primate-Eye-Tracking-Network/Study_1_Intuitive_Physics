@@ -50,6 +50,10 @@ rsconnect/
   
 # Data folder
 data/raw/
+data/temp/
 
 # DS_Store (macbook thing)
 */.DS_Store
+
+# VS code files
+.vscode/
